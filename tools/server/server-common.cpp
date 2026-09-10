@@ -52,6 +52,10 @@ json format_error_response(const std::string & message, const enum error_type ty
             type_str = "exceed_context_size_error";
             code = 400;
             break;
+        case ERROR_TYPE_TOO_MANY_REQUESTS:
+            type_str = "rate_limit_error";
+            code = 429;
+            break;
     }
     return json {
         {"code", code},

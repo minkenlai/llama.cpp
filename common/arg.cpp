@@ -3647,6 +3647,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_MAX"));
     add_opt(common_arg(
+        {"--patience"}, "N",
+        "for router server, patience-for-swap in seconds (default: 0 = disabled)",
+        [](common_params & params, int value) {
+            params.patience = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PATIENCE"));
+    add_opt(common_arg(
+        {"--max-waiting-requests"}, "N",
+        "for router server, maximum size of swap queue (default: 0 = dynamic default based on thread pool size)",
+        [](common_params & params, int value) {
+            params.max_waiting_requests = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MAX_WAITING_REQUESTS"));
+    add_opt(common_arg(
         {"--models-autoload"},
         {"--no-models-autoload"},
         string_format("for router server, whether to automatically load models (default: %s)", params.models_autoload ? "enabled" : "disabled"),

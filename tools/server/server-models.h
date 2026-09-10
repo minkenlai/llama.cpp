@@ -34,7 +34,8 @@ enum server_model_status {
     SERVER_MODEL_STATUS_UNLOADED,
     SERVER_MODEL_STATUS_LOADING,
     SERVER_MODEL_STATUS_LOADED,
-    SERVER_MODEL_STATUS_SLEEPING
+    SERVER_MODEL_STATUS_SLEEPING,
+    SERVER_MODEL_STATUS_DRAINING // draining active in-flight requests; no new requests accepted
 };
 
 enum server_model_source {
@@ -48,6 +49,31 @@ enum server_child_mode {
     SERVER_CHILD_MODE_DOWNLOAD, // download the model and exit
 };
 
+static server_model_status server_model_status_from_string(const std::string & status_str) {
+    if (status_str == "downloading") {
+        return SERVER_MODEL_STATUS_DOWNLOADING;
+    }
+    if (status_str == "downloaded") {
+        return SERVER_MODEL_STATUS_DOWNLOADED;
+    }
+    if (status_str == "unloaded") {
+        return SERVER_MODEL_STATUS_UNLOADED;
+    }
+    if (status_str == "loading") {
+        return SERVER_MODEL_STATUS_LOADING;
+    }
+    if (status_str == "loaded") {
+        return SERVER_MODEL_STATUS_LOADED;
+    }
+    if (status_str == "sleeping") {
+        return SERVER_MODEL_STATUS_SLEEPING;
+    }
+    if (status_str == "draining" || status_str == "unloading") {
+        return SERVER_MODEL_STATUS_DRAINING;
+    }
+    throw std::runtime_error("invalid server model status");
+}
+
 static std::string server_model_status_to_string(server_model_status status) {
     switch (status) {
         case SERVER_MODEL_STATUS_DOWNLOADING: return "downloading";
@@ -56,6 +82,7 @@ static std::string server_model_status_to_string(server_model_status status) {
         case SERVER_MODEL_STATUS_LOADING:     return "loading";
         case SERVER_MODEL_STATUS_LOADED:      return "loaded";
         case SERVER_MODEL_STATUS_SLEEPING:    return "sleeping";
+        case SERVER_MODEL_STATUS_DRAINING:    return "draining";
         default:                              return "unknown";
     }
 }
@@ -91,7 +118,7 @@ struct server_model_meta {
     }
 
     bool is_running() const {
-        return status == SERVER_MODEL_STATUS_LOADED || status == SERVER_MODEL_STATUS_LOADING || status == SERVER_MODEL_STATUS_SLEEPING;
+        return status == SERVER_MODEL_STATUS_LOADED || status == SERVER_MODEL_STATUS_LOADING || status == SERVER_MODEL_STATUS_SLEEPING || status == SERVER_MODEL_STATUS_DRAINING;
     }
 
     bool is_ready_or_sleep() const {
@@ -195,6 +222,10 @@ private:
         std::unordered_map<std::string, entry_t> map;
     };
 
+    // count of threads waiting for a model swap/load
+    int n_waiting_requests = 0;
+    std::vector<int64_t> pending_swaps; // timestamps of threads waiting for a slot
+
     common_preset_context ctx_preset;
 
     common_params base_params;
@@ -210,9 +241,6 @@ private:
 
     void update_meta(const std::string & name, const server_model_meta & meta);
 
-    // unload least recently used models if the limit is reached
-    void unload_lru();
-
     // not thread-safe, caller must hold mutex
     void add_model(server_model_meta && meta);
 
@@ -222,6 +250,8 @@ private:
 
     // notify SSE clients
     void notify_sse(const std::string & event, const std::string & model_id, const json & data = nullptr);
+
+    void reserve_slot(const std::string & name, std::unique_lock<std::mutex> & lk);
 
 public:
     // conv_id -> model tracker for the resumable stream routes, owns its lock
@@ -261,7 +291,7 @@ public:
     // these functions are thread-safe
     void load(const std::string & name);
     void load(const std::string & name, const load_options & opts);
-    void unload(const std::string & name);
+    void unload(const std::string & name, bool force = false);
     void unload_all();
 
     struct update_status_args {
@@ -279,6 +309,10 @@ public:
     // note: only cache models can be removed; returns false if the model doesn't exist or is not a cache model
     bool remove(const std::string & name);
 
+    // block until the model is no longer in draining status to prevent deadlocks
+    void wait_if_draining(const std::string & name);
+    void wait_if_unloading(const std::string & name) { wait_if_draining(name); }
+
     // wait until the model instance is fully loaded (thread-safe)
     // note: predicate is called while holding the lock
     // return when the model no longer in "loading" state
@@ -291,6 +325,9 @@ public:
     // if models_max is reached, the request waits in a queue until a slot frees up
     // throws if the load fails, or if should_stop fires while waiting
     bool ensure_model_ready(const std::string & name, const std::function<bool()> & should_stop = nullptr);
+
+    // calculate recommended Retry-After delay (in seconds) based on remaining patience in the queue
+    int32_t get_patience_retry_after();
 
     // proxy an HTTP request to the model instance
     server_http_res_ptr proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used, bool detached = false);

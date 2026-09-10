@@ -1,5 +1,7 @@
 import threading
 import pytest
+import threading
+import time
 from utils import *
 
 server: ServerProcess
@@ -116,6 +118,142 @@ def test_router_unload_model():
     assert unload_res.status_code == 200
     assert unload_res.body.get("success") is True
     _wait_for_model_status(model_id, {"unloaded"})
+
+
+def test_router_unload_force():
+    global server
+    server.models_max = 1
+    server.patience = 30
+    server.start()
+
+    model_a = "ggml-org/tinygemma3-GGUF:Q8_0"
+    _load_model_and_wait(model_a)
+
+    # Start a request that has some latency
+    def keep_busy():
+        try:
+            server.make_request(
+                "POST",
+                "/v1/chat/completions",
+                data={
+                    "model": model_a,
+                    "messages": [{"role": "user", "content": "Tell me a long story."}],
+                    "max_tokens": 128,
+                },
+            )
+        except Exception:
+            pass
+
+    t = threading.Thread(target=keep_busy)
+    t.daemon = True
+    t.start()
+
+    # Let the request start
+    time.sleep(0.5)
+
+    # Force unload. Since patience is 30s and n_requests > 0, a normal unload would block.
+    # But a force unload should return immediately and kill the model.
+    t_unload_start = time.time()
+    unload_res = server.make_request(
+        "POST",
+        "/models/unload",
+        data={"model": model_a, "force": True}
+    )
+    t_unload_elapsed = time.time() - t_unload_start
+
+    assert unload_res.status_code == 200
+    assert unload_res.body.get("success") is True
+    assert t_unload_elapsed < 5.0
+
+    _wait_for_model_status(model_a, {"unloaded"})
+    t.join(timeout=2)
+
+
+def test_router_unload_graceful_draining():
+    """A graceful unload (force=False) waits for in-flight requests to finish, and incoming requests wait for draining."""
+    global server
+    server.models_max = 1
+    server.start()
+
+    model_a = "ggml-org/tinygemma3-GGUF:Q8_0"
+    _load_model_and_wait(model_a)
+
+    in_flight_res = None
+    in_flight_err = None
+
+    def run_in_flight():
+        nonlocal in_flight_res, in_flight_err
+        try:
+            in_flight_res = server.make_request(
+                "POST",
+                "/v1/chat/completions",
+                data={
+                    "model": model_a,
+                    "messages": [{"role": "user", "content": "Tell me a short story."}],
+                    "max_tokens": 16,
+                },
+            )
+        except Exception as e:
+            in_flight_err = e
+
+    t_flight = threading.Thread(target=run_in_flight)
+    t_flight.start()
+
+    # Let the in-flight request start processing
+    time.sleep(0.5)
+
+    unload_res = None
+    def run_unload():
+        nonlocal unload_res
+        unload_res = server.make_request(
+            "POST",
+            "/models/unload",
+            data={"model": model_a, "force": False}
+        )
+
+    t_unload = threading.Thread(target=run_unload)
+    t_unload.start()
+
+    # Give unload thread a moment to transition the model to draining
+    time.sleep(0.2)
+
+    # A new request for the draining model must be held by wait_if_draining and succeed after reload
+    queued_res = None
+    queued_err = None
+    def run_queued():
+        nonlocal queued_res, queued_err
+        try:
+            queued_res = server.make_request(
+                "POST",
+                "/v1/chat/completions",
+                data={
+                    "model": model_a,
+                    "messages": [{"role": "user", "content": "Hello after draining."}],
+                    "max_tokens": 4,
+                },
+                timeout=60,
+            )
+        except Exception as e:
+            queued_err = e
+
+    t_queued = threading.Thread(target=run_queued)
+    t_queued.start()
+
+    t_flight.join(timeout=60)
+    t_unload.join(timeout=60)
+    t_queued.join(timeout=60)
+
+    # In-flight request must complete with 200
+    assert in_flight_err is None, f"In-flight request failed: {in_flight_err}"
+    assert in_flight_res is not None and in_flight_res.status_code == 200
+
+    # Unload request must succeed with 200
+    assert unload_res is not None and unload_res.status_code == 200
+    assert unload_res.body.get("success") is True
+
+    # Queued request that arrived during draining must succeed after reload
+    assert queued_err is None, f"Queued request during draining failed: {queued_err}"
+    assert queued_res is not None and queued_res.status_code == 200
 
 
 def test_router_models_max_evicts_lru():
@@ -614,3 +752,415 @@ def test_router_delete_model():
     # Model should no longer appear in GET /models
     ids = _get_model_ids(is_reload=False)
     assert MODEL_DOWNLOAD_ID not in ids, f"{MODEL_DOWNLOAD_ID} still present after deletion"
+
+
+def test_router_queues_swapping_requests():
+    global server
+    server.models_max = 1
+    server.start()
+
+    model_a = "ggml-org/tinygemma3-GGUF:Q8_0"
+    model_b = "ggml-org/test-model-stories260K:F32"
+
+    _load_model_and_wait(model_a)
+
+    def run_model_a():
+        return server.make_request(
+            "POST",
+            "/v1/chat/completions",
+            data={
+                "model": model_a,
+                "messages": [{"role": "user", "content": "Write a long story about a happy cat."}],
+                "max_tokens": 16,
+            },
+        )
+
+    def run_model_b():
+        time.sleep(0.5) # ensure model A's request starts first
+        return server.make_request(
+            "POST",
+            "/v1/chat/completions",
+            data={
+                "model": model_b,
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 4,
+            },
+        )
+
+    results = parallel_function_calls([
+        (run_model_a, ()),
+        (run_model_b, ()),
+    ])
+
+    res_a, res_b = results
+    assert res_a.status_code == 200
+    assert res_b.status_code == 200
+    assert "error" not in res_a.body
+    assert "error" not in res_b.body
+
+
+def test_router_patience_window():
+    global server
+    server.models_max = 1
+    server.patience = 5  # 5 seconds patience
+    server.start()
+
+    model_a = "ggml-org/tinygemma3-GGUF:Q8_0"
+    model_b = "ggml-org/test-model-stories260K:F32"
+
+    _load_model_and_wait(model_a)
+
+    # Sequence 1: patience extension
+    stop_event = threading.Event()
+    threads = []
+    
+    def keep_busy():
+        while not stop_event.is_set():
+            try:
+                server.make_request(
+                    "POST",
+                    "/v1/chat/completions",
+                    data={
+                        "model": model_a,
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "max_tokens": 16,
+                    },
+                )
+            except Exception:
+                pass
+            time.sleep(0.01)
+
+    # Start 3 background threads to keep model_a constantly busy
+    for _ in range(3):
+        t = threading.Thread(target=keep_busy)
+        t.daemon = True
+        t.start()
+        threads.append(t)
+
+    # Let the background threads run for a moment to ensure model_a has requests
+    time.sleep(0.5)
+
+    def run_request_b():
+        t_start = time.time()
+        res = server.make_request(
+            "POST",
+            "/v1/chat/completions",
+            data={
+                "model": model_b,
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 4,
+            },
+        )
+        return res, time.time() - t_start
+
+    def run_request_a2():
+        # A2 starts 1.5s after B started (so at t = 2.0s overall)
+        time.sleep(1.5)
+        t_start = time.time()
+        res = server.make_request(
+            "POST",
+            "/v1/chat/completions",
+            data={
+                "model": model_a,
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 4,
+            },
+        )
+        return res, time.time() - t_start
+
+    def stop_busy_loop():
+        # Stop the background threads 3.5s after B started (so at t = 4.0s overall)
+        time.sleep(3.5)
+        stop_event.set()
+        for t in threads:
+            t.join()
+        return None
+
+    results = parallel_function_calls([
+        (run_request_b, ()),
+        (run_request_a2, ()),
+        (stop_busy_loop, ()),
+    ])
+
+    (res_b, b_duration), (res_a2, a2_duration), _ = results
+    assert res_b.status_code == 200
+    assert res_a2.status_code == 200
+    assert "error" not in res_a2.body
+
+    # A2 should have run immediately (short duration, not waiting for swap)
+    assert a2_duration < 3.0
+    # B should have blocked waiting for patience timeout + A2 to complete
+    assert b_duration >= 3.5
+
+    # Sequence 2: voluntarily idle unload
+    # Reload model_a to trigger the idle unload test
+    _load_model_and_wait(model_a)
+
+    # Set server patience to a larger value (15s) and start requests.
+    # Request A completes quickly. Request B starts at t=0.5s.
+    # Once A completes, A's active request count drops to 0, so it should unload immediately.
+    server.stop()
+    server.patience = 15
+    server.start()
+    _load_model_and_wait(model_a)
+
+    def run_quick_a():
+        return server.make_request(
+            "POST",
+            "/v1/chat/completions",
+            data={
+                "model": model_a,
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 2,
+            },
+        )
+
+    def run_pending_b():
+        time.sleep(0.5)
+        t_start = time.time()
+        res = server.make_request(
+            "POST",
+            "/v1/chat/completions",
+            data={
+                "model": model_b,
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 4,
+            },
+        )
+        return res, time.time() - t_start
+
+    results2 = parallel_function_calls([
+        (run_quick_a, ()),
+        (run_pending_b, ()),
+    ])
+
+    res_quick_a, (res_pending_b, b2_duration) = results2
+    assert res_quick_a.status_code == 200
+    assert res_pending_b.status_code == 200
+    # B should load quickly, way before the 15-second patience timeout, because A became idle.
+    assert b2_duration < 8.0
+
+
+def test_router_bounded_queue():
+    global server
+    server.models_max = 1
+    server.max_waiting_requests = 1
+    server.start()
+
+    model_a = "ggml-org/tinygemma3-GGUF:Q8_0"
+    model_b = "ggml-org/test-model-stories260K:F32"
+    model_c = "ggml-org/test-model-stories260K-infill:F32"
+
+    _load_model_and_wait(model_a)
+
+    stop_event = threading.Event()
+    threads = []
+    
+    def keep_busy():
+        while not stop_event.is_set():
+            try:
+                server.make_request(
+                    "POST",
+                    "/v1/chat/completions",
+                    data={
+                        "model": model_a,
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "max_tokens": 16,
+                    },
+                )
+            except Exception:
+                pass
+            time.sleep(0.01)
+
+    # Start 3 background threads to keep model_a constantly busy
+    for _ in range(3):
+        t = threading.Thread(target=keep_busy)
+        t.daemon = True
+        t.start()
+        threads.append(t)
+
+    # Let the background threads run to ensure model_a has requests
+    time.sleep(0.5)
+
+    def run_model_b_queued():
+        t_start = time.time()
+        res = server.make_request(
+            "POST",
+            "/v1/chat/completions",
+            data={
+                "model": model_b,
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 4,
+            },
+        )
+        return res, time.time() - t_start
+
+    def run_model_c_rejected():
+        time.sleep(0.5)
+        t_start = time.time()
+        res = server.make_request(
+            "POST",
+            "/v1/chat/completions",
+            data={
+                "model": model_c,
+                "messages": [{"role": "user", "content": "hello infill"}],
+                "max_tokens": 4,
+            },
+        )
+        return res, time.time() - t_start
+
+    def stop_busy_loop():
+        time.sleep(2.0)
+        stop_event.set()
+        for t in threads:
+            t.join()
+        return None
+
+    results = parallel_function_calls([
+        (run_model_b_queued, ()),
+        (run_model_c_rejected, ()),
+        (stop_busy_loop, ()),
+    ])
+
+    (res_b, b_duration), (res_c, c_duration), _ = results
+    assert res_b.status_code == 200
+    assert res_c.status_code in [429, 503]
+    if res_c.status_code == 429:
+        retry_after = res_c.headers.get("retry-after") or res_c.headers.get("Retry-After")
+        assert retry_after is not None, "429 response missing Retry-After header"
+        assert int(retry_after) >= 1, f"Retry-After header value invalid: {retry_after}"
+
+
+def test_router_concurrent_load():
+    import os
+    global server
+    server.models_max = 1
+    # Create a unique log path for this test so we can inspect it
+    server.log_path = "tmp/test_router_concurrent_load.log"
+    if os.path.exists(server.log_path):
+        os.remove(server.log_path)
+    server.start()
+
+    model_a = "ggml-org/tinygemma3-GGUF:Q8_0"
+
+    def load_req():
+        try:
+            return server.make_request("POST", "/models/load", data={"model": model_a})
+        except Exception as e:
+            return e
+
+    # Send 2 load requests concurrently
+    results = parallel_function_calls([
+        (load_req, ()),
+        (load_req, ()),
+    ])
+
+    # Both requests should either return success (200) or report that the model is already running (400)
+    for res in results:
+        assert not isinstance(res, Exception), f"Request failed with exception: {res}"
+        if res.status_code == 400:
+            assert "already running" in res.body.get("error", {}).get("message", "")
+        else:
+            assert res.status_code == 200
+            assert res.body.get("success") is True
+
+    # Allow some time for processes/threads to stabilize and logs to flush
+    time.sleep(1.0)
+
+    # Stop the server to release the log file
+    server.stop()
+
+    # Read log and verify only one instance was spawned, and no "old process... still alive" warning
+    assert os.path.exists(server.log_path)
+    with open(server.log_path, "r") as f:
+        log_content = f.read()
+
+    # The router should print the spawn message exactly once for this model
+    spawn_count = log_content.count("spawning server instance with name=ggml-org/tinygemma3-GGUF:Q8_0")
+    assert spawn_count == 1, f"Expected exactly 1 spawn log, found {spawn_count}"
+
+    # We should NOT see the warning about old process still alive
+    assert "old process for model name=ggml-org/tinygemma3-GGUF:Q8_0 is still alive" not in log_content
+
+
+def test_router_patience_evicts_busy_model():
+    """When patience expires under sustained traffic, the LRU busy model is evicted to free a slot."""
+    global server
+    server.models_max = 1
+    server.patience = 2  # 2s patience
+    server.start()
+
+    model_a = "ggml-org/tinygemma3-GGUF:Q8_0"
+    model_b = "ggml-org/test-model-stories260K:F32"
+
+    _load_model_and_wait(model_a)
+
+    stop_event = threading.Event()
+    threads = []
+
+    def keep_busy():
+        while not stop_event.is_set():
+            if _get_model_status(model_a) != "loaded":
+                break
+            try:
+                server.make_request(
+                    "POST",
+                    "/v1/chat/completions",
+                    data={
+                        "model": model_a,
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "max_tokens": 8,
+                    },
+                )
+            except Exception:
+                pass
+            time.sleep(0.05)
+
+    for _ in range(2):
+        t = threading.Thread(target=keep_busy)
+        t.daemon = True
+        t.start()
+        threads.append(t)
+    time.sleep(0.5)
+
+    def run_model_b():
+        t_start = time.time()
+        try:
+            res = server.make_request(
+                "POST",
+                "/v1/chat/completions",
+                data={
+                    "model": model_b,
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "max_tokens": 4,
+                },
+                timeout=60,
+            )
+            return res, time.time() - t_start
+        finally:
+            stop_event.set()
+
+    def stop_busy_loop():
+        time.sleep(2.5)
+        stop_event.set()
+        return None
+
+    results = parallel_function_calls([
+        (run_model_b, ()),
+        (stop_busy_loop, ()),
+    ])
+
+    for t in threads:
+        t.join(timeout=5)
+
+    (res_b, elapsed), _ = results
+
+    assert res_b.status_code == 200
+    assert "error" not in res_b.body
+    # Should have waited at least the 2s patience window
+    assert elapsed >= 2.0
+    # Model B is now loaded, Model A was evicted
+    assert _get_model_status(model_b) == "loaded"
+    assert _get_model_status(model_a) == "unloaded"
+
+

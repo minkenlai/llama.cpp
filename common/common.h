@@ -686,6 +686,8 @@ struct common_params {
     int models_max = 4;                 // maximum number of models to load simultaneously
     bool models_autoload = true;        // automatically load models when requested via the router server
     std::string models_preset_hf = "";  // show a warning about remote presets on router loaded (if not empty)
+    int patience = 0;                   // patience-for-swap in seconds (0 = disabled)
+    int max_waiting_requests = 0;       // max size of swap queue (0 = dynamic default)
 
     bool log_json = false;
 
