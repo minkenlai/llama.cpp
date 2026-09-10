@@ -228,6 +228,8 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--models-preset PATH` | path to INI file containing model presets for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_PRESET) |
 | `--models-max N` | for router server, maximum number of models to load simultaneously (default: 4, 0 = unlimited)<br/>(env: LLAMA_ARG_MODELS_MAX) |
 | `--models-autoload, --no-models-autoload` | for router server, whether to automatically load models (default: enabled)<br/>(env: LLAMA_ARG_MODELS_AUTOLOAD) |
+| `--patience N` | for router server, patience-for-swap in seconds (default: 0 = disabled)<br/>(env: LLAMA_ARG_PATIENCE) |
+| `--max-waiting-requests N` | for router server, maximum size of swap queue (default: 0 = dynamic default based on thread pool size)<br/>(env: LLAMA_ARG_MAX_WAITING_REQUESTS) |
 | `--jinja, --no-jinja` | whether to use jinja template engine for chat (default: enabled)<br/>(env: LLAMA_ARG_JINJA) |
 | `--reasoning-format FORMAT` | controls whether thought tags are allowed and/or extracted from the response, and in which format they're returned; one of:<br/>- none: leaves thoughts unparsed in `message.content`<br/>- deepseek: puts thoughts in `message.reasoning_content`<br/>- deepseek-legacy: keeps `<think>` tags in `message.content` while also populating `message.reasoning_content`<br/>(default: auto)<br/>(env: LLAMA_ARG_THINK) |
 | `-rea, --reasoning [on\|off\|auto]` | Use reasoning/thinking in the chat ('on', 'off', or 'auto', default: 'auto' (detect from template))<br/>(env: LLAMA_ARG_REASONING) |
@@ -1794,6 +1796,15 @@ GET /props?model=ggml-org%2Fgemma-3-4b-it-GGUF%3AQ4_K_M
 
 By default, the model will be loaded automatically if it's not loaded. To disable this, add `--no-models-autoload` when starting the server. Additionally, you can include `?autoload=true|false` in the query param to control this behavior per-request.
 
+### Model Queueing and Swap Patience
+
+When `llama-server` is in router mode, it manages multiple model instances. If the number of loaded models exceeds `--models-max N`, the router will evict the least recently used (LRU) model to make room for the new model.
+
+To prevent rapid, inefficient model loading/unloading (thrashing) when multiple requests target different models concurrently, the following features are available:
+
+- **Patience-for-Swap (`--patience <seconds>`)**: If a new request requires loading a different model, the request will wait (queue) until the active model's patience window expires or the number of active requests drops to 0.
+- **Bounded Request Queue (`--max-waiting-requests <N>`)**: Limits the number of requests that can wait in the queue for unloaded models. When full, new incoming requests receive a `429 Too Many Requests` error (OpenAI-compatible `rate_limit_error`) with a dynamic `Retry-After` header indicating how many seconds to wait.
+
 ### GET `/models`: List available models
 
 Listing all models in cache. The model metadata will also include a field to indicate the status of the model:
@@ -1903,13 +1914,14 @@ Response:
 
 ### POST `/models/unload`: Unload a model
 
-Unload a model
+Unload a model. By default, this will gracefully wait for any in-flight requests to finish (`req_count == 0`). You can force immediate termination by setting `"force": true`.
 
 Payload:
 
 ```json
 {
   "model": "ggml-org/gemma-3-4b-it-GGUF:Q4_K_M",
+  "force": false
 }
 ```
 

@@ -291,6 +291,18 @@ The flow for downloading a new model:
 - If a stop request comes in, the router asks the child process to stop (same mechanism as running a model in child process)
 - Otherwise, upon completion, we call `load_models()` to refresh the list of models
 
+### Router mode: model scheduling, queueing, and swap patience
+
+When router mode manages multiple child instances, it limits concurrent active models to `--models-max N`. If capacity is reached, `server_models` and its internal `server_lru_sched` handle slot allocation:
+
+- **Request coalescing**: Concurrent requests targeting the same unloaded model coalesce into a single queue entry. The head waiter executes the load; remaining waiters unblock when the instance reaches `LOADED`.
+- **Idle eviction**: When free slots are needed, `sched->tick()` first evicts idle instances (`req_count == 0`) using LRU order via `request_stop()`.
+- **Swap patience (`--patience <seconds>`)**: If all running instances are busy, requests wait in queue. If the oldest request waits longer than the patience window, the router evicts the true LRU busy instance (`last_used`) to prevent starvation.
+- **Bounded queue (`--max-waiting-requests <N>`)**: Rejects excess queued requests with `429 Too Many Requests` and a dynamic `Retry-After` header to avoid HTTP worker thread pool exhaustion.
+- **Graceful draining**: Non-forced unloads mark the instance as `SERVER_MODEL_STATUS_DRAINING`, allowing active requests to complete while holding new requests before stopping the child process.
+
+For architecture details, flowcharts, and sequence diagrams, see [docs/server-router-queue.md](../../docs/server-router-queue.md).
+
 ### Sleep mode
 
 Sleep mode was initially introduced in PR [#18228](https://github.com/ggml-org/llama.cpp/pull/18228). The main idea is to have:
