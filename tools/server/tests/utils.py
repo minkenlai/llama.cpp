@@ -95,6 +95,8 @@ class ServerProcess:
     models_dir: str | None = None
     models_max: int | None = None
     models_preset: str | None = None
+    patience: int | None = None
+    max_waiting_requests: int | None = None
     no_models_autoload: bool | None = None
     lora_files: List[str] | None = None
     enable_ctx_shift: int | None = False
@@ -192,6 +194,10 @@ class ServerProcess:
             server_args.extend(["--models-preset", self.models_preset])
         if self.cors_origins:
             server_args.extend(["--cors-origins", self.cors_origins])
+        if self.patience is not None:
+            server_args.extend(["--patience", self.patience])
+        if self.max_waiting_requests is not None:
+            server_args.extend(["--max-waiting-requests", self.max_waiting_requests])
         if self.n_batch:
             server_args.extend(["--batch-size", self.n_batch])
         if self.n_ubatch:
@@ -406,10 +412,15 @@ class ServerProcess:
             parse_body = True
         elif method == "OPTIONS":
             response = requests.options(url, headers=headers, timeout=timeout)
+            parse_body = False
+        elif method == "DELETE":
+            response = requests.delete(url, headers=headers, json=data, timeout=timeout)
+            parse_body = True
         else:
             raise ValueError(f"Unimplemented method: {method}")
+
         result = ServerResponse()
-        result.headers = dict(response.headers)
+        result.headers = response.headers
         result.status_code = response.status_code
         if parse_body:
             try:
@@ -428,10 +439,11 @@ class ServerProcess:
         data: dict | None = None,
         headers: dict | None = None,
         host: str | None = None,
+        timeout: float = DEFAULT_HTTP_TIMEOUT,
     ) -> Iterator[dict]:
         url = self.make_url(path, host)
         if method == "POST":
-            response = requests.post(url, headers=headers, json=data, stream=True)
+            response = requests.post(url, headers=headers, json=data, stream=True, timeout=timeout)
         else:
             raise ValueError(f"Unimplemented method: {method}")
         if response.status_code != 200:

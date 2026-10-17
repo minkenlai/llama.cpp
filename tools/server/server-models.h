@@ -37,7 +37,8 @@ enum server_model_status {
     SERVER_MODEL_STATUS_UNLOADED,
     SERVER_MODEL_STATUS_LOADING,
     SERVER_MODEL_STATUS_LOADED,
-    SERVER_MODEL_STATUS_SLEEPING
+    SERVER_MODEL_STATUS_SLEEPING,
+    SERVER_MODEL_STATUS_DRAINING // draining active in-flight requests; no new requests accepted
 };
 
 enum server_model_source {
@@ -60,6 +61,7 @@ static std::string server_model_status_to_string(server_model_status status) {
         case SERVER_MODEL_STATUS_LOADING:     return "loading";
         case SERVER_MODEL_STATUS_LOADED:      return "loaded";
         case SERVER_MODEL_STATUS_SLEEPING:    return "sleeping";
+        case SERVER_MODEL_STATUS_DRAINING:    return "draining";
         default:                              return "unknown";
     }
 }
@@ -96,7 +98,7 @@ struct server_model_meta {
     }
 
     bool is_running() const {
-        return status == SERVER_MODEL_STATUS_LOADED || status == SERVER_MODEL_STATUS_LOADING || status == SERVER_MODEL_STATUS_SLEEPING;
+        return status == SERVER_MODEL_STATUS_LOADED || status == SERVER_MODEL_STATUS_LOADING || status == SERVER_MODEL_STATUS_SLEEPING || status == SERVER_MODEL_STATUS_DRAINING;
     }
 
     bool is_ready_or_sleep() const {
@@ -250,6 +252,9 @@ private:
         std::unordered_map<std::string, entry_t> map;
     };
 
+    // count of threads waiting for a model swap/load
+    int n_waiting_requests = 0;
+
     common_preset_context ctx_preset;
 
     common_params base_params;
@@ -273,7 +278,7 @@ private:
 
     // ask the monitor to stop a running instance; send_exit is false for a child that was already force-killed
     // not thread-safe, caller must hold mutex
-    void request_stop(const std::string & name, bool send_exit = true);
+    void request_stop(const std::string & name, bool send_exit = true, bool force = false);
 
     // called by the monitor once a child exited and was reaped
     void on_child_exit(const std::string & name, const std::shared_ptr<server_subproc> & proc, server_child_mode mode, int exit_code);
@@ -333,7 +338,7 @@ public:
     // these functions are thread-safe
     void load(const std::string & name);
     void load(const std::string & name, const load_options & opts);
-    void unload(const std::string & name);
+    void unload(const std::string & name, bool force = false);
     void unload_all();
 
     struct update_status_args {
@@ -363,6 +368,9 @@ public:
     // if models_max is reached, the request waits in a queue until a slot frees up
     // throws if the load fails, or if should_stop fires while waiting
     bool ensure_model_ready(const std::string & name, const std::function<bool()> & should_stop = nullptr);
+
+    // calculate recommended Retry-After delay (in seconds) based on remaining patience in the queue
+    int32_t get_patience_retry_after();
 
     // proxy an HTTP request to the model instance
     server_http_res_ptr proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used, bool detached = false);

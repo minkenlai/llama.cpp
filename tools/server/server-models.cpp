@@ -301,7 +301,7 @@ struct server_lru_sched {
             SRV_INF("request for name=%s joined the queue, %d waiting\n", model_id.c_str(), e->n_waiters);
             return;
         }
-        queue.push_back({ model_id, 1, false });
+        queue.push_back({ model_id, 1, false, ggml_time_ms() });
         SRV_INF("request for name=%s queued at position %zu\n",
                 model_id.c_str(), queue.size());
     }
@@ -318,9 +318,25 @@ struct server_lru_sched {
         }
     }
 
-    bool queue_empty(std::unique_lock<std::mutex> & lk) {
+    int32_t get_retry_after(std::unique_lock<std::mutex> & lk) {
         check_lock(lk);
-        return queue.empty();
+        if (models.base_params.patience > 0 && !queue.empty()) {
+            int64_t elapsed = ggml_time_ms() - queue.front().queued_at;
+            int64_t patience_ms = (int64_t) models.base_params.patience * 1000;
+            if (elapsed < patience_ms) {
+                int64_t remaining_ms = patience_ms - elapsed;
+                return (int32_t) ((remaining_ms + 999) / 1000) + 1;
+            }
+        }
+        return 2;
+    }
+
+    bool patience_expired(std::unique_lock<std::mutex> & lk) {
+        check_lock(lk);
+        if (models.base_params.patience <= 0 || queue.empty()) {
+            return false;
+        }
+        return ggml_time_ms() - queue.front().queued_at >= (int64_t) models.base_params.patience * 1000;
     }
 
     // true if it is this model's turn to load, and nobody is loading it yet
@@ -384,9 +400,26 @@ struct server_lru_sched {
         while (n_free < n_needed) {
             std::string victim = pick_victim(lk);
             if (victim.empty()) {
-                return; // all remaining models are busy, wait for a request to end
+                if (models.base_params.patience > 0 && !queue.empty()) {
+                    int64_t elapsed = ggml_time_ms() - queue.front().queued_at;
+                    if (elapsed >= (int64_t) models.base_params.patience * 1000) {
+                        int64_t oldest_used = 0;
+                        for (const auto & m : models.mapping) {
+                            if (!m.second.meta.is_ready_or_sleep() || models.stopping_models.count(m.first) || find(m.first)) {
+                                continue;
+                            }
+                            if (victim.empty() || m.second.meta.last_used < oldest_used) {
+                                victim      = m.first;
+                                oldest_used = m.second.meta.last_used;
+                            }
+                        }
+                    }
+                }
+                if (victim.empty()) {
+                    return; // all remaining models are busy, wait for a request to end or patience to expire
+                }
             }
-            SRV_INF("evicting idle LRU name=%s for a queued request\n", victim.c_str());
+            SRV_INF("evicting LRU name=%s for a queued request\n", victim.c_str());
             models.request_stop(victim);
             n_free++;
         }
@@ -397,6 +430,7 @@ struct server_lru_sched {
         std::string model_id;
         int  n_waiters; // requests waiting for this model
         bool loading;   // one of the waiters is doing the load right now
+        int64_t queued_at = 0;
     };
 
     entry_t * find(const std::string & model_id) {
@@ -579,6 +613,22 @@ server_models::server_models(
         LOG_WRN("using original argv[0] as fallback: %s\n", argv[0]);
     }
     unfinished_downloads.load();
+
+    int n_threads_http = base_params.n_threads_http;
+    if (n_threads_http < 1) {
+        unsigned int hw_concurrency = std::thread::hardware_concurrency();
+        n_threads_http = std::max(base_params.n_parallel + 4, hw_concurrency > 0 ? (int)hw_concurrency - 1 : 8);
+    }
+    int thread_pool_size = std::max(8, n_threads_http);
+
+    if (base_params.max_waiting_requests == 0) {
+        base_params.max_waiting_requests = std::max(1, thread_pool_size - 4);
+    } else if (base_params.max_waiting_requests >= thread_pool_size) {
+        int capped_val = std::max(1, thread_pool_size - 1);
+        LOG_WRN("max-waiting-requests (%d) >= thread pool size (%d). Capping to %d to prevent thread pool exhaustion and deadlock.\n",
+            base_params.max_waiting_requests, thread_pool_size, capped_val);
+        base_params.max_waiting_requests = capped_val;
+    }
     load_models();
     debug_fake_timing = !common_get_env("LLAMA_SERVER_DEBUG_FAKE_TIMING").empty();
 }
@@ -1484,12 +1534,22 @@ void server_models::load(const std::string & name, const load_options & opts) {
     cv.notify_all();
 }
 
-void server_models::request_stop(const std::string & name, bool send_exit) {
+void server_models::request_stop(const std::string & name, bool send_exit, bool force) {
     auto it = mapping.find(name);
-    if (it == mapping.end() || stopping_models.count(name)) {
+    if (it == mapping.end()) {
+        return;
+    }
+    if (stopping_models.count(name) && !force) {
         return;
     }
     stopping_models.insert(name);
+    if (it->second.meta.status == SERVER_MODEL_STATUS_LOADED || it->second.meta.status == SERVER_MODEL_STATUS_SLEEPING) {
+        it->second.meta.status = SERVER_MODEL_STATUS_DRAINING;
+    }
+    cv.notify_all();
+    if (!force && it->second.req_count > 0) {
+        return; // defer monitor->stop until in-flight requests drain
+    }
     monitor->stop(name, it->second.meta.stop_timeout, send_exit);
 }
 
@@ -1515,7 +1575,7 @@ void server_models::on_child_exit(const std::string & name, const std::shared_pt
     }
 }
 
-void server_models::unload(const std::string & name) {
+void server_models::unload(const std::string & name, bool force) {
     std::unique_lock<std::mutex> lk(mutex);
     auto it = mapping.find(name);
     if (it != mapping.end()) {
@@ -1529,13 +1589,21 @@ void server_models::unload(const std::string & name) {
         } else if (it->second.meta.is_running()) {
             SRV_INF("stopping model instance name=%s\n", name.c_str());
             bool loading = it->second.meta.status == SERVER_MODEL_STATUS_LOADING;
-            if (loading) {
-                // special case: if model is in loading state, unloading means force-killing it
-                SRV_WRN("model name=%s is still loading, force-killing\n", name.c_str());
-                it->second.subproc->terminate();
+            bool force_kill = loading || force;
+            if (force_kill) {
+                SRV_WRN("model name=%s is force-killed\n", name.c_str());
+                if (it->second.subproc) {
+                    it->second.subproc->terminate();
+                }
             }
-            request_stop(name, !loading);
-            // status change will be handled by the monitor
+            auto old_subproc = it->second.subproc;
+            request_stop(name, !force_kill, force_kill);
+            cv.wait(lk, [this, &name, &old_subproc]() {
+                auto it = mapping.find(name);
+                return it == mapping.end()
+                    || it->second.meta.status == SERVER_MODEL_STATUS_UNLOADED
+                    || it->second.subproc != old_subproc;
+            });
         } else {
             SRV_WRN("model instance name=%s is not running\n", name.c_str());
         }
@@ -1554,7 +1622,7 @@ void server_models::unload_all() {
             if (loading) {
                 inst.subproc->terminate();
             }
-            request_stop(name, !loading);
+            request_stop(name, !loading, true);
         }
     }
     // wait for every child to exit, the monitor force-kills the ones that ignore the exit command
@@ -1690,7 +1758,7 @@ bool server_models::remove(const std::string & name) {
         if (loading) {
             it->second.subproc->terminate();
         }
-        request_stop(name, !loading);
+        request_stop(name, !loading, true);
     }
 
     // wait until the child is gone
@@ -1745,6 +1813,24 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
     if (!stopping && meta->status == SERVER_MODEL_STATUS_SLEEPING) {
         return false; // child is sleeping but still running; new request will wake it up
     }
+    {
+        std::unique_lock<std::mutex> lk(mutex);
+        if (n_waiting_requests >= base_params.max_waiting_requests) {
+            SRV_WRN("model swap queue full (%d >= %d), failing request\n",
+                n_waiting_requests, base_params.max_waiting_requests);
+            throw std::runtime_error("model swap queue full, try again later");
+        }
+        n_waiting_requests++;
+    }
+
+    struct waiting_guard {
+        server_models & parent;
+        waiting_guard(server_models & p) : parent(p) {}
+        ~waiting_guard() {
+            std::lock_guard<std::mutex> lk(parent.mutex);
+            parent.n_waiting_requests--;
+        }
+    } guard(*this);
 
     bool queued   = false;
     bool did_load = false;
@@ -1817,6 +1903,10 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
                 throw std::runtime_error("request cancelled while waiting for model name=" + name);
             }
 
+            if (sched->patience_expired(lk)) {
+                sched->tick(lk);
+            }
+
             // our turn: our model is at the head, and a slot really did free up
             if (status == SERVER_MODEL_STATUS_UNLOADED && sched->try_claim(lk, name)) {
                 lk.unlock();
@@ -1848,6 +1938,11 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
     return true;
 }
 
+int32_t server_models::get_patience_retry_after() {
+    std::unique_lock<std::mutex> lk(mutex);
+    return sched->get_retry_after(lk);
+}
+
 server_http_res_ptr server_models::proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used, bool detached) {
     auto meta = get_meta(name);
     if (!meta.has_value()) {
@@ -1856,12 +1951,14 @@ server_http_res_ptr server_models::proxy_request(const server_http_req & req, co
     if (!meta->is_running()) {
         throw std::invalid_argument("model name=" + name + " is not running");
     }
+    std::shared_ptr<server_subproc> subproc;
     {
         std::unique_lock<std::mutex> lk(mutex);
         if (update_last_used) {
             mapping[name].meta.last_used = ggml_time_ms();
         }
         mapping[name].req_count++;
+        subproc = mapping[name].subproc;
     }
     if (debug_fake_timing) {
         // sleep after req_count++, so the model counts as busy while we wait here
@@ -1889,17 +1986,20 @@ server_http_res_ptr server_models::proxy_request(const server_http_req & req, co
             base_params.timeout_write
             );
 
-    proxy->cleanup = [this, name]() {
+    proxy->cleanup = [this, name, subproc]() {
         std::unique_lock<std::mutex> lk(mutex);
         auto it = mapping.find(name);
-        if (it != mapping.end() && it->second.req_count > 0) {
+        if (it != mapping.end() && it->second.subproc == subproc && it->second.req_count > 0) {
             it->second.req_count--;
             if (it->second.req_count == 0) {
+                if (stopping_models.count(name)) {
+                    monitor->stop(name, it->second.meta.stop_timeout, true);
+                }
                 sched->tick(lk);
             }
+            cv.notify_all();
         }
     };
-
     return proxy;
 }
 
@@ -2251,7 +2351,8 @@ static bool router_validate_model(std::string & name, server_models & models, bo
     }
     // resolve alias to canonical model name
     name = meta->name;
-    if (!models_autoload && !meta->is_running()) {
+
+    if (!models_autoload && (!meta->is_running() || meta->status == SERVER_MODEL_STATUS_DRAINING)) {
         res_err(res, format_error_response("model is not loaded", ERROR_TYPE_INVALID_REQUEST));
         return false;
     }
@@ -2351,7 +2452,17 @@ void server_models_routes::init_routes() {
             return error_res;
         }
         if (autoload) {
-            models.ensure_model_ready(name, req.should_stop);
+            try {
+                models.ensure_model_ready(name, req.should_stop);
+            } catch (const std::exception & e) {
+                std::string msg = e.what();
+                if (msg.find("queue full") != std::string::npos) {
+                    res_err(error_res, format_error_response(msg, ERROR_TYPE_TOO_MANY_REQUESTS));
+                    error_res->headers["Retry-After"] = std::to_string(models.get_patience_retry_after());
+                    return error_res;
+                }
+                throw;
+            }
         }
         return models.proxy_request(req, method, name, false);
     };
@@ -2391,7 +2502,20 @@ void server_models_routes::init_routes() {
         uint64_t ticket = models.conv_models.remember(conv_id, name);
         // a dead socket must not cancel a session request, only a stop does (checked right below)
         auto should_stop = ticket == 0 ? req.should_stop : nullptr;
-        bool waited = autoload && models.ensure_model_ready(name, should_stop);
+        bool waited = false;
+        if (autoload) {
+            try {
+                waited = models.ensure_model_ready(name, should_stop);
+            } catch (const std::exception & e) {
+                std::string msg = e.what();
+                if (msg.find("queue full") != std::string::npos) {
+                    res_err(error_res, format_error_response(msg, ERROR_TYPE_TOO_MANY_REQUESTS));
+                    error_res->headers["Retry-After"] = std::to_string(models.get_patience_retry_after());
+                    return error_res;
+                }
+                throw;
+            }
+        }
         if (ticket != 0 && !models.conv_models.alive(conv_id, ticket)) {
             SRV_INF("request for conv_id=%s cancelled while model name=%s was loading\n",
                     conv_id.c_str(), name.c_str());
@@ -2553,6 +2677,7 @@ void server_models_routes::init_routes() {
         auto res = std::make_unique<server_http_res>();
         json body = json::parse(req.body);
         std::string name = json_value(body, "model", std::string());
+        bool force = json_value(body, "force", false);
         auto model = models.get_meta(name);
         if (!model.has_value()) {
             res_err(res, format_error_response("model is not found", ERROR_TYPE_INVALID_REQUEST));
@@ -2562,7 +2687,7 @@ void server_models_routes::init_routes() {
             res_err(res, format_error_response("model is not running", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
-        models.unload(model->name);
+        models.unload(model->name, force);
         res_ok(res, {{"success", true}});
         return res;
     };
